@@ -13,30 +13,9 @@ from PyQt6.QtWidgets import (
     QFileDialog,
 )
 from PyQt6 import QtCore, QtWidgets
-from src.asmr_api.OLD_get_asmr_works import get_asmr_downlist_api
 from src.read_conf import ReadConf
 from src.language.language_manager import language_manager
-from threading import Event
 import ipaddress
-
-class DownloadThread(QThread):
-    download_finished = pyqtSignal(str)
-    download_progress = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.stop_event = Event()  # 创建线程停止事件
-
-    def run(self):
-        try:
-            success, message = get_asmr_downlist_api(self.stop_event)  # 传入停止事件
-            if not self.stop_event.is_set():  # 检查是否是正常完成
-                self.download_finished.emit(message)
-        except Exception as e:
-            self.download_finished.emit(f"{language_manager.get_text('error_occurred')}: {str(e)}")
-
-    def stop(self):
-        self.stop_event.set()  # 设置停止标志
 
 
 class LoginThread(QThread):

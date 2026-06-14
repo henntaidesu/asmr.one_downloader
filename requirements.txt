@@ -1,5 +1,4 @@
 PyQt6
 requests
-tqdm
 pymysql
 configparser
