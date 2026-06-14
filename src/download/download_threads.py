@@ -5,7 +5,29 @@
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from src.asmr_api.get_down_list import get_down_list
-from src.download.download_utils import get_work_detail_sync
+from src.download.download_utils import get_work_detail_sync, update_work_review_status
+
+
+class ReviewThread(QThread):
+    """后台更新作品收听状态(review)的线程
+
+    review() 会发同步 HTTP 请求；放在后台线程执行，避免在主线程(下载完成回调)
+    中阻塞 UI。
+    """
+    review_done = pyqtSignal(str, bool)  # work_id, success
+
+    def __init__(self, work_id, progress=None):
+        super().__init__()
+        self.work_id = work_id
+        self.progress = progress  # 指定状态(如 'postponed' 搁置)，None 表示按默认(听过/在听)
+
+    def run(self):
+        try:
+            ok = update_work_review_status(self.work_id, progress=self.progress)
+            self.review_done.emit(str(self.work_id), bool(ok))
+        except Exception as e:
+            print(f"review 线程错误: {e}")
+            self.review_done.emit(str(self.work_id), False)
 
 
 class WorkDetailThread(QThread):
@@ -20,7 +42,10 @@ class WorkDetailThread(QThread):
     def run(self):
         try:
             detail = get_work_detail_sync(self.work_id)
-            if detail:
+            # 错误哨兵(如 TOKEN_EXPIRED)以字符串形式返回，需作为错误传播而非详情
+            if isinstance(detail, str):
+                self.error_occurred.emit(detail)
+            elif detail:
                 self.detail_loaded.emit(detail)
             else:
                 self.error_occurred.emit("Failed to get work detail")

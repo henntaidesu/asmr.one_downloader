@@ -272,14 +272,14 @@ def get_work_detail_sync(work_id):
         return None
 
 
-def update_work_review_status(work_id):
-    """更新作品审核状态"""
+def update_work_review_status(work_id, progress=None):
+    """更新作品收听状态。progress 指定时直接使用(如 'postponed' 搁置)，否则按 DB 配置取听过/在听"""
     try:
         from src.asmr_api.works_review import review
         conf = ReadConf()
         check_db = conf.check_DB()
-        review(int(work_id), check_db)
-        print(f"已更新作品 RJ{work_id} 的状态")
+        review(int(work_id), check_db, progress=progress)
+        print(f"已更新作品 RJ{work_id} 的状态: {progress or ('listened' if check_db else 'listening')}")
         return True
     except Exception as e:
         print(f"更新作品状态失败: {str(e)}")

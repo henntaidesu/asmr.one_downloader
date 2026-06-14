@@ -264,11 +264,22 @@ class DownloadThread(QThread):
                     print(f"断点续传: {filename}, 从 {file_downloaded} 字节开始")
 
                 print(f"开始下载文件: {filename} (尝试 {retry_count + 1}/{max_retries + 1})")
-                response = requests.get(download_url, headers=headers, stream=True, 
+                response = requests.get(download_url, headers=headers, stream=True,
                                       proxies=proxy_url, timeout=self.request_timeout)
                 response.raise_for_status()
-                
-                with open(file_path, 'ab' if file_downloaded > 0 else 'wb') as f:
+
+                # 校验服务器是否真正支持断点续传：请求了 Range 却返回 200(而非 206)，
+                # 说明服务器忽略 Range 发回了完整文件，此时若以追加模式写入会损坏文件，
+                # 必须从头重新下载。
+                resume = file_downloaded > 0 and response.status_code == 206
+                if file_downloaded > 0 and response.status_code != 206:
+                    print(f"服务器未按 Range 续传(状态码 {response.status_code})，从头重新下载: {filename}")
+                    file_downloaded = 0
+                    file_start_downloaded = 0
+                # 进度计算的基准下载量：续传时为初始已下载量，否则从 0 计
+                progress_base = initial_downloaded if resume else 0
+
+                with open(file_path, 'ab' if resume else 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if self.is_cancelled:
                             return False, file_downloaded
@@ -284,7 +295,7 @@ class DownloadThread(QThread):
 
                             f.write(chunk)
                             file_downloaded += chunk_size
-                            current_total_downloaded = total_downloaded_before + (file_downloaded - initial_downloaded)
+                            current_total_downloaded = total_downloaded_before + (file_downloaded - progress_base)
 
                             # 更新进度
                             progress = min(int((current_total_downloaded / actual_total_size) * 100), 100) if actual_total_size > 0 else 0
@@ -303,17 +314,22 @@ class DownloadThread(QThread):
                                 self.last_update_time = current_time
                                 self.last_downloaded = current_total_downloaded
 
-                            # 检查下载速度
+                            # 检查下载速度（滑动窗口：只统计最近一个检查区间内的速度，
+                            # 而非从文件开始至今的累计平均，否则前期高速会掩盖中途卡死）
                             file_elapsed = current_time - file_start_time
-                            if file_elapsed >= self.min_speed_check_interval:  # 检查间隔后开始监控
+                            if file_elapsed >= self.min_speed_check_interval:
                                 file_downloaded_in_period = file_downloaded - file_start_downloaded
                                 file_speed_bps = file_downloaded_in_period / file_elapsed
                                 file_speed_kbps = file_speed_bps / 1024
-                                
+
                                 if file_speed_kbps < self.min_speed_kbps:
                                     print(f"文件 {filename} 速度过慢 ({file_speed_kbps:.2f} KB/s < {self.min_speed_kbps} KB/s)，重新下载")
                                     response.close()  # 关闭当前连接
                                     raise SpeedTooSlowException(f"速度过慢: {file_speed_kbps:.2f} KB/s")
+
+                                # 重置窗口，下个区间重新测量
+                                file_start_time = current_time
+                                file_start_downloaded = file_downloaded
 
                 # 文件下载完成
                 print(f"文件下载完成: {filename}")
@@ -501,18 +517,22 @@ class MultiFileDownloadManager(QThread):
         self.start_next_download()  # 开始下一个下载
 
     def on_download_error(self, work_id, error):
-        """下载错误处理"""
+        """下载错误处理：跳过失败的作品并继续下载队列中的下一个
+
+        (旧行为是清空整个队列并停止；一次临时网络抖动会把后面所有排队作品全部丢弃，
+        改为只跳过当前失败作品，继续后续下载。)
+        """
         if work_id in self.active_downloads:
             thread = self.active_downloads[work_id]
             thread.quit()
             thread.wait()
             del self.active_downloads[work_id]
 
-        # 清空下载队列，停止后续下载
-        self.download_queue.clear()
-        
+        # 通知 UI 标记该作品失败（但不停止整体下载）
         self.download_failed.emit(work_id, error)
-        # 不再自动开始下一个下载，让用户决定是否继续
+
+        # 继续下载队列中的下一个作品
+        self.start_next_download()
 
     def pause_download(self, work_id):
         """暂停指定下载"""
@@ -533,7 +553,15 @@ class MultiFileDownloadManager(QThread):
             del self.active_downloads[work_id]
 
     def run(self):
-        """启动下载管理器"""
-        while len(self.active_downloads) < self.max_concurrent and self.download_queue:
-            self.start_next_download()
-            time.sleep(0.1)
+        """下载管理器不需要独立工作线程。
+
+        实际下载在各 DownloadThread 工作线程中进行；本管理器对象创建于主线程，
+        其槽函数(on_download_finished / on_download_error / start_next_download)
+        均通过信号在主线程的事件循环中执行，对 download_queue / active_downloads
+        的访问全部发生在主线程，无需加锁。
+
+        过去这里有一个 while 循环在管理器自己的工作线程里调用 start_next_download，
+        会与主线程并发访问上述两个无锁字典(竞态)。现已不再以 start() 启动本线程，
+        run() 保留为空以防误调用产生并发。
+        """
+        return

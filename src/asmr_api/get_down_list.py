@@ -15,6 +15,9 @@ def get_down_list():
         web_site = 'asmr-200.com'
     elif website_course == 'Mirror-3':
         web_site = 'asmr-300.com'
+    else:
+        # 配置值非法时回退到原站，避免 web_site 未定义抛 NameError
+        web_site = 'asmr.one'
 
     if check_DB:
         url = f'https://api.{web_site}/api/review?order=updated_at&sort=desc&page=1&filter=listening'
@@ -77,10 +80,14 @@ def get_down_list():
             print(f"成功获取到 {len(req['works'])} 个作品")
             data = req['works']
             for work in data:
+                work_id = work['id']
+                # source_id 是站点规范 RJ 号；缺失时按号长度回退(6 位号补 6 位，否则 8 位)，
+                # 避免对经典 6 位作品错误补成 8 位导致目录命名不符
+                rj_fallback = f"RJ{work_id:06d}" if len(str(work_id)) == 6 else f"RJ{work_id:08d}"
                 work_info = {
-                    'id': work['id'],
+                    'id': work_id,
                     'title': work['title'],
-                    'source_id': work.get('source_id', f"RJ{work['id']:08d}"),  # 从接口读取 source_id，如果没有则使用默认格式
+                    'source_id': work.get('source_id') or rj_fallback,
                 }
                 id_list.append(work_info)
         else:

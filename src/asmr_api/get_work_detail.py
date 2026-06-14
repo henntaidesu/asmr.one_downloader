@@ -23,6 +23,9 @@ def get_work_detail(work_id):
         web_site = 'asmr-200.com'
     elif website_course == 'Mirror-3':
         web_site = 'asmr-300.com'
+    else:
+        # 配置值非法时回退到原站，避免 web_site 未定义抛 NameError
+        web_site = 'asmr.one'
 
     url = f'https://api.{web_site}/api/tracks/{work_id}?v=1'
 
@@ -43,6 +46,11 @@ def get_work_detail(work_id):
 
     try:
         response = requests.get(url, headers=headers, proxies=proxy_url)
+        # 区分 token 过期：与 get_down_list 保持一致返回 TOKEN_EXPIRED 哨兵，
+        # 而非笼统当作网络错误返回 None，使 UI 能提示重新登录
+        if response.status_code == 401:
+            print("获取作品详情失败：Token 认证失败 (401)")
+            return "TOKEN_EXPIRED"
         response.raise_for_status()
         tracks_data = response.json()
 

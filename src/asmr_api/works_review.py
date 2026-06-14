@@ -10,20 +10,24 @@ sys.path.insert(0, project_root)
 from src.read_conf import ReadConf
 
 
-def review(work_id, check_DB):
+def review(work_id, check_DB, progress=None):
     """
     更新作品的收听状态
-    
+
     Args:
         work_id (int): 作品ID
         check_DB (bool): 是否标记为已听完（True）或正在收听（False）
-    
+        progress (str): 直接指定状态值(如 'postponed' 搁置)，给定时优先于 check_DB
+
     Returns:
         bool: 是否更新成功
     """
     try:
-        print(f"更新作品 {work_id} 状态: {'已听完' if check_DB else '正在收听'}")
-        
+        # asmr.one 状态枚举：marked(想听)/listening(在听)/listened(听过)/replay(重听)/postponed(搁置)
+        if progress is None:
+            progress = 'listened' if check_DB else 'listening'
+        print(f"更新作品 {work_id} 状态: {progress}")
+
         conf = ReadConf()
 
         website_course = conf.read_website_course()
@@ -35,6 +39,9 @@ def review(work_id, check_DB):
             web_site = 'asmr-200.com'
         elif website_course == 'Mirror-3':
             web_site = 'asmr-300.com'
+        else:
+            # 配置值非法时回退到原站，避免 web_site 未定义抛 NameError
+            web_site = 'asmr.one'
         url = f'https://api.{web_site}/api/review'
 
         user_data = conf.read_asmr_user()
@@ -42,16 +49,10 @@ def review(work_id, check_DB):
         headers = {
             'authorization': f'Bearer {token}'
         }
-        if check_DB:
-            data = {
-                'progress': 'listened',
-                'work_id': work_id,
-            }
-        else:
-            data = {
-                'progress': 'listening',
-                'work_id': work_id,
-            }
+        data = {
+            'progress': progress,
+            'work_id': work_id,
+        }
 
         proxy = conf.read_proxy_conf()
         if proxy['open_proxy']:
@@ -62,7 +63,8 @@ def review(work_id, check_DB):
         else:
             proxy_url = None
 
-        response = requests.put(url, headers=headers, data=data, proxies=proxy_url, timeout=30)
+        # asmr.one 的 /api/review 接口期望 JSON body，用 json= 而非 data=(form 编码)
+        response = requests.put(url, headers=headers, json=data, proxies=proxy_url, timeout=30)
         response.raise_for_status()
         print(f"成功更新作品 {work_id} 状态")
         return True

@@ -23,11 +23,17 @@ class MySQLDB:
         self.db = read_db_conf.read_database()
 
     def insert(self, sql):
+        # 只关闭游标，不关闭连接：否则同一实例后续 update/select/delete 会因连接已关而报错
         cursor = self.db.cursor()
         cursor.execute(sql)
         self.db.commit()
-        self.db.close()
+        cursor.close()
         return True
+
+    def close(self):
+        """显式关闭数据库连接"""
+        if hasattr(self, 'db') and self.db:
+            self.db.close()
 
     def update(self, sql):
         cursor = self.db.cursor()

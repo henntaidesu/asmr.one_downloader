@@ -88,7 +88,7 @@ class ReadConf:
         timeout = int(self.config.get('down_conf', 'timeout'))
         min_speed = int(self.config.get('down_conf', 'min_speed'))
         min_speed_check = int(self.config.get('down_conf', 'min_speed_check'))
-        if download_path[1:] == '\\' or download_path[1:] == '/':
+        if download_path.endswith('\\') or download_path.endswith('/'):
             download_path = download_path[:-1]
         if '\\' in download_path:
             download_path = download_path.replace('\\', '/')
@@ -102,19 +102,20 @@ class ReadConf:
         }
 
     def write_speed_limit(self, speed_limit):
-        self.config.set('down_conf', 'speed_limit', speed_limit)
+        # configparser.set 要求值为字符串，传入数字会抛 TypeError
+        self.config.set('down_conf', 'speed_limit', str(speed_limit))
         config_path = self.get_config_path()
         with open(config_path, 'w', encoding='utf-8') as configfile:
             self.config.write(configfile)
 
     def write_max_retries(self, max_retries):
-        self.config.set('down_conf', 'max_retries', max_retries)
+        self.config.set('down_conf', 'max_retries', str(max_retries))
         config_path = self.get_config_path()
         with open(config_path, 'w', encoding='utf-8') as configfile:
             self.config.write(configfile)
 
     def write_timeout(self, timeout):
-        self.config.set('down_conf', 'timeout', timeout)
+        self.config.set('down_conf', 'timeout', str(timeout))
         config_path = self.get_config_path()
         with open(config_path, 'w', encoding='utf-8') as configfile:
             self.config.write(configfile)
@@ -168,7 +169,7 @@ class ReadConf:
 
 
     def write_download_conf(self, speed_limit, download_path):
-        self.config.set('down_conf', 'speed_limit', speed_limit)
+        self.config.set('down_conf', 'speed_limit', str(speed_limit))
         self.config.set('down_conf', 'download_path', download_path)
         config_path = self.get_config_path()
         with open(config_path, 'w', encoding='utf-8') as configfile:

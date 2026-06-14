@@ -21,12 +21,12 @@ from src.download.download_utils import (
     build_file_filter_stats_text, validate_work_detail_for_download,
     create_download_item_data, calculate_global_speed
 )
-from src.download.download_threads import WorkDetailThread, DownloadListThread
+from src.download.download_threads import WorkDetailThread, DownloadListThread, ReviewThread
 from src.download.download_manager_utils import (
     setup_download_manager, update_download_path_if_needed,
-    process_download_completion, get_ready_download_items,
+    get_ready_download_items,
     start_first_download_and_queue_others, stop_all_downloads,
-    check_download_queue_status, clear_download_items_from_layout,
+    clear_download_items_from_layout,
     handle_error_types
 )
 from src.read_conf import ReadConf
@@ -476,6 +476,10 @@ class DownloadItemWidget(QWidget):
         self.size_label.setText(language_manager.get_text('failed_to_get'))
         self.status_label.setText(f"{language_manager.get_text('error')}: {error_msg}")
 
+        # token 过期时引导用户重新登录；交由父窗口统一处理(去重，避免多个作品各弹一次)
+        if error_msg == "TOKEN_EXPIRED" and self.parent_page:
+            self.parent_page.handle_token_expired_from_detail()
+
     def start_download(self):
         """开始下载（由全局按钮调用）"""
         if not validate_work_detail_for_download(self.work_detail):
@@ -494,6 +498,9 @@ class DownloadItemWidget(QWidget):
         self.is_paused = True
         self.status_label.setText(language_manager.get_text('paused'))
         self.speed_label.setText("0 KB/s")
+        # 真正暂停底层下载线程，否则文件仍在全速下载、UI 却显示已暂停
+        if self.parent_page and self.parent_page.download_manager:
+            self.parent_page.download_manager.pause_download(str(self.work_info['id']))
 
     def resume_download(self):
         """继续下载（由全局按钮调用）"""
@@ -501,6 +508,9 @@ class DownloadItemWidget(QWidget):
             return
         self.is_paused = False
         self.status_label.setText(language_manager.get_text('downloading'))
+        # 恢复底层下载线程
+        if self.parent_page and self.parent_page.download_manager:
+            self.parent_page.download_manager.resume_download(str(self.work_info['id']))
 
 
     def update_progress(self, progress, downloaded_bytes=0, total_bytes=0, status="下载中..."):
@@ -539,6 +549,21 @@ class DownloadItemWidget(QWidget):
             self.speed_label.setText("0 KB/s")
             self.is_downloading = False
 
+    def mark_completed(self):
+        """标记为下载完成：进度 100%、速度清零，且保持已下载量/总量显示正确
+        (不要用 update_progress(100,0,0)，那会把已下载量显示重置为 0、总量回退成未过滤的 API 原始大小)"""
+        self.progress_bar.setValue(100)
+        self.status_label.setText(language_manager.get_text('completed'))
+        self.speed_label.setText("0 KB/s")
+        self.download_speed = 0.0
+        self.is_downloading = False
+        self.is_paused = False
+        # 用下载过程中记录的实际总大小，显示为 总量/总量
+        total = self.total_bytes if self.total_bytes > 0 else calculate_actual_total_size(self.work_detail)
+        if total > 0:
+            total_formatted = format_bytes(total)
+            self.size_label.setText(f"{total_formatted}/{total_formatted}")
+
     def update_speed(self, speed_kbps):
         """更新下载速度显示"""
         self.download_speed = speed_kbps
@@ -574,8 +599,8 @@ class DownloadItemWidget(QWidget):
         else:
             self.speed_label.setText(f"{self.download_speed:.1f} {language_manager.get_text('kb_per_second')}")
 
-        # 更新加载状态
-        if not self.work_detail and self.size_label.text() == "Loading...":
+        # 更新加载状态(初始文案在不同语言下不同，不能只硬编码英文 "Loading..." 比较)
+        if not self.work_detail and self.size_label.text() in ("Loading...", language_manager.get_text('loading')):
             self.size_label.setText(language_manager.get_text('loading'))
 
 
@@ -589,6 +614,10 @@ class DownloadPage(QWidget):
         self.download_manager = None
         self.is_downloading_active = False  # 跟踪是否有活动下载
         self.auto_refresh_enabled = True   # 是否启用自动刷新功能
+        self._token_expired_dialog_shown = False  # 避免多个作品详情同时报 token 过期时重复弹窗
+        self.review_threads = []  # 持有后台 review 线程引用，防止被 GC 提前回收
+        self.work_fail_counts = {}  # work_id(str) -> 本会话下载失败次数
+        self.MAX_WORK_RETRIES = 3  # 自动刷新循环中，单个作品达到此失败次数后不再自动重试，避免空转
         self.setup_ui()
         self.setup_download_manager()
         self.load_download_list()
@@ -697,7 +726,8 @@ class DownloadPage(QWidget):
         self.download_manager.speed_updated.connect(self.on_speed_updated)
         self.download_manager.file_filter_stats.connect(self.on_file_filter_stats)
 
-        self.download_manager.start()
+        # 不启动管理器的工作线程：下载由各 DownloadThread 负责，管理器槽函数
+        # 在主线程事件循环中通过信号执行，避免对队列字典的跨线程竞态访问。
 
     def update_download_path(self):
         """动态更新下载路径，无需重启程序"""
@@ -706,6 +736,10 @@ class DownloadPage(QWidget):
     def load_download_list(self):
         self.status_label.setText(language_manager.get_text('loading'))
         self.refresh_button.setEnabled(False)
+        # 新一轮刷新，允许再次提示 token 过期
+        self._token_expired_dialog_shown = False
+        # 用户主动刷新视为重新尝试，清空失败计数，给持续失败项一次重试机会
+        self.work_fail_counts.clear()
 
         self.list_thread = DownloadListThread()
         self.list_thread.list_updated.connect(self.on_list_updated)
@@ -761,6 +795,22 @@ class DownloadPage(QWidget):
         if error_msg == "TOKEN_EXPIRED" and result == QMessageBox.StandardButton.Ok:
             self.open_settings()
 
+    def handle_token_expired_from_detail(self):
+        """作品详情加载时检测到 token 过期：弹一次提示并跳转设置(去重)"""
+        if self._token_expired_dialog_shown:
+            return
+        self._token_expired_dialog_shown = True
+
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Icon.Warning)
+        msg_box.setWindowTitle(language_manager.get_text('error'))
+        msg_box.setText(language_manager.get_text('token_expired'))
+        msg_box.setInformativeText(language_manager.get_text('relogin_required'))
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        result = msg_box.exec()
+        if result == QMessageBox.StandardButton.Ok:
+            self.open_settings()
+
     def add_download_item(self, work_info):
         item_widget = DownloadItemWidget(work_info, parent_page=self)
         item_widget.detail_ready.connect(self.check_start_all_button)
@@ -806,9 +856,32 @@ class DownloadPage(QWidget):
         from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
+    def start_review_thread(self, work_id, progress=None):
+        """在后台线程标记作品收听状态(review)。progress 指定时直接使用(如 'postponed' 搁置)"""
+        thread = ReviewThread(work_id, progress=progress)
+        self.review_threads.append(thread)
+        # 完成后从列表移除并安全回收线程对象
+        thread.review_done.connect(lambda wid, ok, t=thread: self._on_review_done(t, wid, ok))
+        thread.start()
+
+    def _on_review_done(self, thread, work_id, success):
+        """review 后台线程完成的清理回调"""
+        if not success:
+            print(f"作品 {work_id} 状态标记失败(将于下次刷新重试)")
+        thread.quit()
+        thread.wait()
+        if thread in self.review_threads:
+            self.review_threads.remove(thread)
+
     def on_download_started(self, work_id):
         """下载开始"""
         print(f"开始下载: {work_id}")
+        # 管理器从队列启动后续下载时，对应 widget 的 is_downloading 仍为 False，
+        # 会导致 calculate_global_speed 把它过滤掉、总速度显示为 0。这里补上标记。
+        if work_id in self.download_items:
+            item = self.download_items[work_id]
+            item.is_downloading = True
+            item.is_paused = False
 
     def on_download_progress(self, work_id, progress, downloaded, total, status):
         """下载进度更新"""
@@ -817,47 +890,70 @@ class DownloadPage(QWidget):
 
     def on_download_completed(self, work_id):
         """下载完成"""
-        process_download_completion(work_id)
+        # 在后台线程标记作品收听状态(review)，避免同步 HTTP 阻塞主线程/卡 UI
+        self.start_review_thread(work_id)
         if work_id in self.download_items:
-            self.download_items[work_id].update_progress(100, 0, 0, language_manager.get_text('completed'))
+            self.download_items[work_id].mark_completed()
         self.update_global_speed()
 
-        # 检查是否还有等待中的下载任务
-        queue_status = check_download_queue_status(self.download_manager)
-        if queue_status == "has_queue":
-            # 获取 RJ 号用于显示
+        # 还有后续任务则继续，否则收尾(自动刷新或重置)
+        if not self._finalize_batch_if_idle():
             rj_display = work_id
             if work_id in self.download_items:
                 work_info = self.download_items[work_id].work_info
                 rj_display = work_info.get('source_id', f"RJ{work_id}")
             self.status_label.setText(f"{language_manager.get_text('download_completed')}: {rj_display}, {language_manager.get_text('continue_next')}")
+
+    def _finalize_batch_if_idle(self):
+        """若下载队列与活动下载均已清空，则收尾(按需自动刷新或重置按钮)。
+
+        返回 True 表示本批已收尾；返回 False 表示仍有任务在进行，调用方应显示"继续下一个"。
+        """
+        manager = self.download_manager
+        busy = manager and (len(manager.download_queue) > 0 or len(manager.active_downloads) > 0)
+        if busy:
+            return False
+
+        if self.auto_refresh_enabled and self.is_downloading_active:
+            print("所有下载任务完成，开始自动刷新列表...")
+            self.status_label.setText("所有下载完成，正在自动刷新列表...")
+            # 延迟3秒后自动刷新，给用户一些时间看到完成状态
+            QTimer.singleShot(3000, self.auto_refresh_and_continue)
         else:
-            # 所有下载完成，检查是否需要自动刷新列表
-            if self.auto_refresh_enabled and self.is_downloading_active:
-                print("所有下载任务完成，开始自动刷新列表...")
-                self.status_label.setText("所有下载完成，正在自动刷新列表...")
-                # 延迟3秒后自动刷新，给用户一些时间看到完成状态
-                QTimer.singleShot(3000, self.auto_refresh_and_continue)
-            else:
-                # 所有下载完成，重置按钮状态
-                self.is_downloading_active = False
-                self.start_all_button.setText(language_manager.get_text('start_download'))
-                self.start_all_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-                self.status_label.setText(language_manager.get_text('all_downloads_completed'))
+            self.is_downloading_active = False
+            self.start_all_button.setText(language_manager.get_text('start_download'))
+            self.start_all_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+            self.status_label.setText(language_manager.get_text('all_downloads_completed'))
+        return True
 
     def on_download_failed(self, work_id, error):
-        """下载失败"""
+        """下载失败：标记该作品失败，但不停止整体下载——管理器会自动继续下一个作品"""
         if work_id in self.download_items:
             self.download_items[work_id].set_error(error)
         self.update_global_speed()
-        
-        # 下载失败时重置按钮状态
-        self.is_downloading_active = False
-        self.start_all_button.setText(language_manager.get_text('start_download'))
-        self.start_all_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        
-        # 显示错误对话框
-        self.show_download_error(work_id, error)
+
+        # 记录失败次数，供自动刷新循环判断是否放弃该作品(避免对持续失败项无限重试)
+        self.work_fail_counts[work_id] = self.work_fail_counts.get(work_id, 0) + 1
+
+        # 达到最大重试次数即放弃：在服务器端把该作品标为"搁置(postponed)"，
+        # 使其移出"想听"列表，不再于后续刷新中重复出现
+        if self.work_fail_counts[work_id] >= self.MAX_WORK_RETRIES:
+            print(f"作品 {work_id} 多次下载失败，标记为搁置(postponed)")
+            self.start_review_thread(work_id, progress='postponed')
+
+        # 用 RJ 号在状态栏提示失败(不再为每个失败弹模态框打断顺序下载)
+        rj_display = work_id
+        if work_id in self.download_items:
+            rj_display = self.download_items[work_id].work_info.get('source_id', f"RJ{work_id}")
+
+        # 还有后续任务则继续，否则收尾
+        if not self._finalize_batch_if_idle():
+            self.status_label.setText(
+                f"{language_manager.get_text('error')}: {rj_display} {language_manager.get_text('download_failed')}, "
+                f"{language_manager.get_text('continue_next')}")
+        else:
+            self.status_label.setText(
+                f"{language_manager.get_text('error')}: {rj_display} {language_manager.get_text('download_failed')}")
 
     def on_speed_updated(self, work_id, speed_kbps):
         """速度更新"""
@@ -1021,8 +1117,14 @@ class DownloadPage(QWidget):
 
     def auto_refresh_and_continue(self):
         """自动刷新列表并继续下载"""
+        # 若用户在上一批完成后的延迟窗口内点了"停止"，则取消本次自动刷新，
+        # 否则"刷新-下载"循环无法真正终止
+        if not self.is_downloading_active or not self.auto_refresh_enabled:
+            print("已停止下载，取消自动刷新")
+            return
+
         print("开始执行自动刷新...")
-        
+
         # 禁用刷新按钮，防止用户重复点击
         self.refresh_button.setEnabled(False)
         self.status_label.setText("正在获取新的下载列表...")
@@ -1037,30 +1139,41 @@ class DownloadPage(QWidget):
     def on_auto_refresh_completed(self, works_list):
         """自动刷新完成，更新列表并自动开始下载"""
         print(f"自动刷新成功，获取到 {len(works_list)} 个新的下载项目")
-        
+
+        # 过滤掉本会话已多次失败的作品：它们不会被标记为已听，会在每次刷新时重复出现，
+        # 若不剔除会对持续失败项(如已下架/404)形成无限重试循环
+        pending = [w for w in works_list
+                   if self.work_fail_counts.get(str(w['id']), 0) < self.MAX_WORK_RETRIES]
+        exhausted_count = len(works_list) - len(pending)
+        if exhausted_count:
+            print(f"跳过 {exhausted_count} 个已达最大重试次数的失败作品")
+
         # 清空现有列表
         self.clear_all_items()
 
-        # 添加新的下载项
-        for work in works_list:
+        # 添加可下载的新项
+        for work in pending:
             self.add_download_item(work)
 
-        self.count_label.setText(f"{language_manager.get_text('total_count')}: {len(works_list)}")
-        
-        if works_list:
+        self.count_label.setText(f"{language_manager.get_text('total_count')}: {len(pending)}")
+
+        if pending:
             # 自动开始下载新列表
             print("自动开始下载新列表...")
-            self.status_label.setText(f"已刷新列表，获取到 {len(works_list)} 个新项目，正在自动开始下载...")
-            
+            self.status_label.setText(f"已刷新列表，获取到 {len(pending)} 个新项目，正在自动开始下载...")
+
             # 等待所有详情加载完成后再开始下载
             QTimer.singleShot(2000, self.auto_start_downloads)
         else:
-            # 没有新的下载项，停止自动下载
-            print("没有获取到新的下载项目，停止自动下载")
+            # 没有可下载的新项(为空，或剩余项均已达最大重试次数)，停止自动循环
+            print("没有可下载的新项目，停止自动下载")
             self.is_downloading_active = False
             self.start_all_button.setText(language_manager.get_text('start_download'))
             self.start_all_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-            self.status_label.setText("刷新完成，但没有新的下载项目")
+            if exhausted_count:
+                self.status_label.setText(f"剩余 {exhausted_count} 个作品多次下载失败，已停止自动重试(可手动刷新重试)")
+            else:
+                self.status_label.setText("刷新完成，但没有新的下载项目")
 
     def on_auto_refresh_failed(self, error_msg):
         """自动刷新失败"""
