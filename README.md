@@ -1,4 +1,7 @@
-# 用于在ASMR.ONE中下载ASMR 现已支持 中文 英文 日语
+# 本项目目前已经停止维护 请移步到 https://github.com/henntaidesu/R-18MediaLibrary
+# 如果有BUG 请在issues中提出 会进行有限修复
+
+## 用于在ASMR.ONE中下载ASMR 现已支持 中文 英文 日语
 
 ## 使用说明
 
